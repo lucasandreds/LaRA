@@ -1,0 +1,32 @@
+--- 0 graus (103 cenas) ---
+  manter as 4 vistas:      29.42 dB
+  descarte aleatorio:      26.96 dB
+  descarte pelo detector:  29.42 dB   (descartou em 0/103, acertou a vista 3 em 0/1)
+  oraculo (tira a vista 3): 27.04 dB
+
+--- margem: ganho do melhor trio sobre as 4 vistas (dB) ---
+--- 5 graus (103 cenas) ---
+  manter as 4 vistas:      20.20 dB
+  descarte aleatorio:      21.68 dB
+  descarte pelo detector:  26.96 dB   (descartou em 99/103, acertou a vista 3 em 99/99)
+  oraculo (tira a vista 3): 27.04 dB
+
+--- margem: ganho do melhor trio sobre as 4 vistas (dB) ---
+--- 10 graus (103 cenas) ---
+  manter as 4 vistas:      17.37 dB
+  descarte aleatorio:      20.13 dB
+  descarte pelo detector:  27.04 dB   (descartou em 103/103, acertou a vista 3 em 103/103)
+  oraculo (tira a vista 3): 27.04 dB
+
+--- margem: ganho do melhor trio sobre as 4 vistas (dB) ---
+--- 20 graus (103 cenas) ---
+  manter as 4 vistas:      15.42 dB
+  descarte aleatorio:      18.98 dB
+  descarte pelo detector:  27.04 dB   (descartou em 103/103, acertou a vista 3 em 103/103)
+  oraculo (tira a vista 3): 27.04 dB
+
+--- margem: ganho do melhor trio sobre as 4 vistas (dB) ---
+   0 graus: min  -0.60   mediana   0.28   max   1.96
+   5 graus: min   1.45   mediana   9.76   max  21.45
+  10 graus: min   3.48   mediana  13.56   max  23.20
+  20 graus: min   5.22   mediana  16.19   max  23.27

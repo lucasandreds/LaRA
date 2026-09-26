@@ -13,3 +13,7 @@ __pycache__/
 logs/*
 outputs/*
 ckpts/*
+
+# datasets (grandes demais para o GitHub)
+dataset/
+build.log

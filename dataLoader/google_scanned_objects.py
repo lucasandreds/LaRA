@@ -6,6 +6,7 @@ from tqdm import tqdm
 from multiprocessing import Pool
 import copy
 import cv2
+import os
 import random
 from PIL import Image
 import torch
@@ -13,6 +14,21 @@ import json
 from dataLoader.utils import build_rays
 from scipy.spatial.transform import Rotation as R
 from dataLoader.utils import intrinsic_to_fov, KMean, read_pfm
+
+def perturb_c2w(c2w, rot_deg, trans_deg, rng):
+    """Gira a orientação da câmera em rot_deg graus e desloca sua posição
+    em trans_deg graus ao redor da origem (centro do objeto), em eixos aleatórios."""
+    def rand_rot(deg):
+        axis = rng.normal(size=3); axis /= np.linalg.norm(axis)
+        a = np.deg2rad(deg)
+        K = np.array([[0, -axis[2], axis[1]],
+                      [axis[2], 0, -axis[0]],
+                      [-axis[1], axis[0], 0]])
+        return np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * K @ K   # fórmula de Rodrigues
+    c2w = c2w.copy()
+    c2w[:3, :3] = rand_rot(rot_deg) @ c2w[:3, :3]    # erro de orientação
+    c2w[:3, 3]  = rand_rot(trans_deg) @ c2w[:3, 3]   # erro de posição (mesma distância ao centro)
+    return c2w.astype(np.float32)
 
 class GoogleObjsDataset(torch.utils.data.Dataset):
     def __init__(self, cfg):
@@ -26,7 +42,7 @@ class GoogleObjsDataset(torch.utils.data.Dataset):
         i_test = np.arange(len(scenes_name))[::10][:cfg.n_scenes]
         i_train = np.array([i for i in np.arange(len(scenes_name)) if
                         (i not in i_test)])[:cfg.n_scenes]
-        self.scenes_name =  scenes_name#[i_train] if self.split=='train' else scenes_name[i_test]
+        self.scenes_name = scenes_name[i_test]
         
         self.n_group = cfg.n_group
         self.build_metas()
@@ -97,6 +113,26 @@ class GoogleObjsDataset(torch.utils.data.Dataset):
         tar_w2cs = tar_w2cs.copy() @ tar_c2ws[:1] @ ref_w2c
         tar_c2ws = transform_mats @ tar_c2ws.copy()
 
+        # ===== experimento: ruido na pose de uma vista de entrada =====
+        noise_rot = float(os.environ.get('NOISE_ROT', 0))
+        noise_trans = float(os.environ.get('NOISE_TRANS', 0))
+        noise_view = int(os.environ.get('NOISE_VIEW', 1))
+        assert 1 <= noise_view < self.n_group, "a vista 0 e referencia; ruido so nas vistas de entrada 1..n_group-1"
+        if noise_rot > 0 or noise_trans > 0:
+            rng = np.random.default_rng(int(os.environ.get('NOISE_SEED', 0)) + index)
+            tar_c2ws[noise_view] = perturb_c2w(tar_c2ws[noise_view], noise_rot, noise_trans, rng)
+            tar_w2cs[noise_view] = np.linalg.inv(tar_c2ws[noise_view]).astype(np.float32)
+        # ================================================================
+        # ===== descarte / hold-out de uma vista de entrada =====
+        drop = int(os.environ.get('DROP_VIEW', -1))
+        if drop >= 0:
+            keep = [v for v in range(len(tar_views)) if v != drop]
+            order = keep + ([drop] if os.environ.get('HOLDOUT') else [])
+            tar_img, tar_dep, tar_msks = tar_img[order], tar_dep[order], tar_msks[order]
+            tar_c2ws, tar_w2cs, tar_ixts = tar_c2ws[order], tar_w2cs[order], tar_ixts[order]
+            tar_views = [tar_views[v] for v in order]
+        # ========================================================
+        
         ret = {'fovx':scene_info['fovx'][tar_views[0]], 
                'fovy':scene_info['fovy'][tar_views[0]],
                }

@@ -1,4 +1,5 @@
 import os
+import json
 
 n_thread = 1
 os.environ["MKL_NUM_THREADS"] = f"{n_thread}" 
@@ -67,6 +68,22 @@ def main(cfg):
         normal_white = ((output['rend_normal_fine'][0]*alpha+1-alpha) + 1)/2
 
         n_view = cfg.n_views
+        
+        # ===== detector A: PSNR de cada vista de entrada na propria pose (analogo a Eq. 6 do SG-NeRF) =====
+        if i == 0:
+            print('chaves da saida do modelo:', list(output.keys()))
+        if os.environ.get('DETECT_LOG'):
+            N_tot = sample['tar_rgb'].shape[1]
+            W_ = images.shape[1] // N_tot
+            rec = {'scene': name}
+            for tag, key in [('fine', 'image_fine'), ('coarse', 'image')]:
+                if key in output:
+                    img_k = output[key][0]
+                    rec[tag] = [float(-10 * torch.log10(((img_k[:, k*W_:(k+1)*W_] - img_gt[:, k*W_:(k+1)*W_])**2).mean()))
+                                for k in range(n_view)]
+            with open(os.environ['DETECT_LOG'], 'a') as f:
+                f.write(json.dumps(rec) + '\n')
+        # ==================================================================================================
 
         
         if i<100:
