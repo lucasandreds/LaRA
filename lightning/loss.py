@@ -57,7 +57,7 @@ class Losses(nn.Module):
                     scalar_stats.update({f'normal{prex}': normal_error.detach()})
                     loss += normal_error*0.2
 
-        if getattr(self.cfg, 'use_confidence', False) and 'view_error' in output and 'view_confidence' in output:
+        if getattr(self.cfg, 'use_confidence', False) and output.get('confidence_active', True) and 'view_error' in output and 'view_confidence' in output:
             errors = output['view_error']
             confidence = output['view_confidence'].detach()
             if errors.dim() == 2 and confidence.dim() == 2:

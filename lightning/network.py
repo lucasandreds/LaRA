@@ -62,9 +62,12 @@ class GroupAttBlock(L.LightningModule):
         super().__init__()
 
         self.norm1 = norm_layer(inner_dim)
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=inner_dim, num_heads=num_heads, kdim=cond_dim, vdim=cond_dim,
-            dropout=attn_drop, bias=attn_bias, batch_first=True)
+        self.q_proj = nn.Linear(inner_dim, inner_dim, bias=attn_bias)
+        self.k_proj = nn.Linear(cond_dim, inner_dim, bias=attn_bias)
+        self.v_proj = nn.Linear(cond_dim, inner_dim, bias=attn_bias)
+        self.out_proj = nn.Linear(inner_dim, inner_dim, bias=attn_bias)
+        self.num_heads = num_heads
+        self.scale = 1.0 / np.sqrt(inner_dim // num_heads)
 
         self.cnn = nn.Conv3d(inner_dim, inner_dim, kernel_size=3, padding=1, bias=False)
 
@@ -78,7 +81,7 @@ class GroupAttBlock(L.LightningModule):
             nn.Dropout(mlp_drop),
         )
         
-    def forward(self, x, cond, group_axis, block_size):
+    def forward(self, x, cond, group_axis, block_size, view_conf=None):
         # x: [B, C, D, H, W]
         # cond: [B, L_cond, D_cond]
 
@@ -88,9 +91,31 @@ class GroupAttBlock(L.LightningModule):
         patches = x.unfold(2, block_size, block_size).unfold(3, block_size, block_size).unfold(4, block_size, block_size)
         patches = patches.reshape(B, C, -1, block_size**3)
         patches = torch.einsum('bcgl->bglc',patches).reshape(B*group_axis**3, block_size**3,C)
-     
-        # cross attention
-        patches = patches + self.cross_attn(self.norm1(patches), cond, cond, need_weights=False)[0]
+
+        q = self.q_proj(self.norm1(patches))
+        k = self.k_proj(cond)
+        v = self.v_proj(cond)
+
+        N, Lq, _ = q.shape
+        _, Lk, _ = k.shape
+        head_dim = q.shape[-1] // self.num_heads
+        q = q.reshape(N, Lq, self.num_heads, head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(N, Lk, self.num_heads, head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(N, Lk, self.num_heads, head_dim).permute(0, 2, 1, 3)
+
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        if view_conf is not None:
+            view_conf = view_conf.to(cond.device).float().detach()
+            conf = view_conf[:, :, None].expand(B, view_conf.shape[1], block_size**3).reshape(B, -1)
+            conf = conf[:, None, :].expand(B * group_axis**3, 1, conf.shape[1])
+            attn_bias = torch.log(conf.clamp_min(1e-9).detach())
+            attn_logits = attn_logits + attn_bias.unsqueeze(1)
+
+        attn_weights = attn_logits.softmax(dim=-1)
+        out = torch.matmul(attn_weights, v).permute(0, 2, 1, 3).reshape(N, Lq, -1)
+        out = self.out_proj(out)
+        patches = patches + out
         patches = patches + self.mlp(self.norm2(patches))
 
         # 3D CNN
@@ -135,7 +160,7 @@ class VolTransformer(L.LightningModule):
         self.norm = nn.LayerNorm(embed_dim, eps=eps)
         self.deconv = nn.ConvTranspose3d(embed_dim, out_dim, kernel_size=2, stride=2, padding=0)
 
-    def forward(self, image_feats):
+    def forward(self, image_feats, view_conf=None):
         # image_feats: [B, N_views, C, DHW]
         # camera_embeddings: [N, D_mod]
         
@@ -153,7 +178,8 @@ class VolTransformer(L.LightningModule):
 
         for i, layer in enumerate(self.layers):
             group_idx = i%len(self.block_size)
-            x = layer(x, volume_feats[group_idx], self.n_groups[group_idx], self.block_size[group_idx])
+            group_view_conf = view_conf.to(image_feats.device).float() if view_conf is not None else None
+            x = layer(x, volume_feats[group_idx], self.n_groups[group_idx], self.block_size[group_idx], view_conf=group_view_conf)
 
         x = self.norm(torch.einsum('bcdhw->bdhwc',x))
         x = torch.einsum('bdhwc->bcdhw',x)
@@ -297,9 +323,11 @@ class Network(L.LightningModule):
         self.confidence_min = float(getattr(cfg, 'confidence_min', getattr(getattr(cfg, 'confidence', None), 'min_confidence', 0.05)))
         self.confidence_lambda = float(getattr(cfg, 'confidence_lambda', getattr(getattr(cfg, 'confidence', None), 'lambda_conf', 0.01)))
         self.confidence_attention_scale = float(getattr(cfg, 'confidence_attention_scale', getattr(getattr(cfg, 'confidence', None), 'attention_scale', 1.0)))
+        self.confidence_warmup_steps = int(getattr(cfg, 'confidence_warmup_steps', getattr(getattr(cfg, 'confidence', None), 'warmup_steps', 2000)))
 
         self.register_buffer('view_confidence', torch.full((1, 4), 0.25, dtype=torch.float32))
         self.register_buffer('view_error_ema', torch.zeros(1, 4, dtype=torch.float32))
+        self.confidence_state = {}
 
         # modules
         self.img_encoder = DinoWrapper(
@@ -359,6 +387,33 @@ class Network(L.LightningModule):
         return grid.reshape(reso,reso,reso,3)*self.scene_size
 
     
+    def _stable_view_key(self, batch, sample_idx, view_idx):
+        meta = batch.get('meta', {})
+        scene_raw = meta.get('scene', 'unknown')
+        if isinstance(scene_raw, (list, tuple)):
+            scene_name = scene_raw[sample_idx] if sample_idx < len(scene_raw) else 'unknown'
+        else:
+            scene_name = str(scene_raw)
+
+        view_ids = meta.get('tar_view', [])
+        if isinstance(view_ids, (list, tuple)) and len(view_ids) > sample_idx and isinstance(view_ids[sample_idx], (list, tuple)):
+            view_id = view_ids[sample_idx][view_idx] if len(view_ids[sample_idx]) > view_idx else view_idx
+        else:
+            view_id = view_idx
+
+        return f'{scene_name}:{int(sample_idx)}:{int(view_id)}'
+
+    def _confidence_is_active(self):
+        if not self.use_confidence:
+            return False
+        if self.confidence_warmup_steps <= 0:
+            return True
+        trainer = getattr(self, 'trainer', None)
+        step = getattr(self, 'global_step', 0)
+        if trainer is not None:
+            step = getattr(trainer, 'global_step', step)
+        return int(step) >= int(self.confidence_warmup_steps)
+
     def _confidence_from_errors(self, errors):
         if not self.use_confidence:
             return torch.full_like(errors, 1.0 / errors.shape[-1])
@@ -367,25 +422,51 @@ class Network(L.LightningModule):
         scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return scores
 
-    def _get_view_confidence(self, batch_size, n_views_sel, device):
-        if not self.use_confidence:
-            conf = torch.full((batch_size, n_views_sel), 1.0 / n_views_sel, device=device, dtype=torch.float32)
+    def _get_view_confidence(self, batch, batch_size, n_views_sel, device):
+        if not self.use_confidence or not self._confidence_is_active():
+            conf = torch.ones((batch_size, n_views_sel), device=device, dtype=torch.float32)
             return conf
 
-        conf = self.view_confidence.to(device).expand(batch_size, -1)
-        conf = conf[:, :n_views_sel]
-        conf = conf.clamp_min(self.confidence_min)
-        conf = conf / conf.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        conf = torch.empty((batch_size, n_views_sel), device=device, dtype=torch.float32)
+        for i in range(batch_size):
+            errors = []
+            for j in range(n_views_sel):
+                key = self._stable_view_key(batch, i, j)
+                if key not in self.confidence_state:
+                    self.confidence_state[key] = torch.tensor(0.0, device=device, dtype=torch.float32)
+                errors.append(self.confidence_state[key].detach().clone())
+            errors = torch.stack(errors)
+            scores = torch.exp(-errors / max(self.confidence_temperature, 1e-6))
+            scores = scores.clamp_min(self.confidence_min)
+            scores = scores / scores.sum().clamp_min(1e-6)
+            conf[i] = scores
         return conf
 
-    def update_confidence(self, current_errors):
-        if not self.use_confidence:
+    def update_confidence(self, batch, current_errors):
+        if not self.use_confidence or not self._confidence_is_active():
             return
 
-        current_errors = current_errors.detach().mean(dim=0, keepdim=True)
-        self.view_error_ema = self.confidence_ema_beta * self.view_error_ema + (1 - self.confidence_ema_beta) * current_errors.to(self.view_error_ema.device)
-        conf = self._confidence_from_errors(self.view_error_ema)
-        self.view_confidence = conf.detach().to(self.view_confidence.device)
+        B, n_views_sel = current_errors.shape
+        for i in range(B):
+            for j in range(n_views_sel):
+                key = self._stable_view_key(batch, i, j)
+                err = current_errors[i, j].detach().float()
+                if key not in self.confidence_state:
+                    self.confidence_state[key] = err.clone()
+                else:
+                    old = self.confidence_state[key]
+                    self.confidence_state[key] = self.confidence_ema_beta * old + (1.0 - self.confidence_ema_beta) * err
+
+        for i in range(B):
+            scores = []
+            for j in range(n_views_sel):
+                key = self._stable_view_key(batch, i, j)
+                scores.append(self.confidence_state.get(key, torch.tensor(0.0, device=current_errors.device, dtype=torch.float32)))
+            scores = torch.stack(scores)
+            scores = torch.exp(-scores / max(self.confidence_temperature, 1e-6))
+            scores = scores.clamp_min(self.confidence_min)
+            scores = scores / scores.sum().clamp_min(1e-6)
+            self.view_confidence = scores.detach().to(self.view_confidence.device).reshape(1, -1)
 
     def compute_view_error(self, batch, output):
         if 'image' not in output:
@@ -425,10 +506,12 @@ class Network(L.LightningModule):
 
         # img features
         feats_vol = feats_vol.view(-1,n_views_sel,n_channel,self.feat_vol_reso,self.feat_vol_reso,self.feat_vol_reso)
-        if view_conf is not None:
-            base_conf = torch.full_like(view_conf, 1.0 / n_views_sel)
+        if view_conf is not None and self._confidence_is_active():
             conf_scale = 1.0 + self.confidence_attention_scale * (view_conf / view_conf.mean(dim=-1, keepdim=True).clamp_min(1e-6) - 1.0)
-            feats_vol = feats_vol * conf_scale.view(-1, n_views_sel, 1, 1, 1, 1)
+            conf_scale = conf_scale.view(-1, n_views_sel, 1, 1, 1, 1)
+            # robust attention-style conditioning: modulate the view contribution before the transformer,
+            # instead of hard scaling raw features that would later be re-normalized by LayerNorm.
+            feats_vol = feats_vol * conf_scale.detach()
 
         return feats_vol
     
@@ -490,7 +573,7 @@ class Network(L.LightningModule):
         else:
             n_views_sel = self.cfg.n_views
 
-        view_conf = self._get_view_confidence(B, n_views_sel, batch['tar_rgb'].device) if self.use_confidence else None
+        view_conf = self._get_view_confidence(batch, B, n_views_sel, batch['tar_rgb'].device) if self.use_confidence else None
 
         _inps =batch['tar_rgb'][:,:n_views_sel].reshape(B*n_views_sel,H,W,C)
         _inps = torch.einsum('bhwc->bchw', _inps)
@@ -508,7 +591,7 @@ class Network(L.LightningModule):
             feat_vol = torch.cat((feat_vol, self.view_embed[:,:n_views_sel].expand(B,-1,-1,self.feat_vol_reso,self.feat_vol_reso,self.feat_vol_reso)),dim=2)
 
         # decoding
-        volume_feat_up = self.vol_decoder(feat_vol)
+        volume_feat_up = self.vol_decoder(feat_vol, view_conf=view_conf)
 
         # rendering
         _offset_coarse, _shs_coarse, _scaling_coarse, _rotation_coarse, _opacity_coarse = self.decoder.forward_coarse(volume_feat_up, self.opacity_shift, self.scaling_shift)
@@ -584,11 +667,13 @@ class Network(L.LightningModule):
 
         outputs = {k: torch.stack([d[k] for d in outputs]) for k in outputs[0]}
         if self.use_confidence:
+            outputs['confidence_active'] = self._confidence_is_active()
             view_error = self.compute_view_error(batch, outputs)
             if view_error is not None:
                 outputs['view_error'] = view_error
-                outputs['view_confidence'] = self.view_confidence.to(outputs['image'].device).expand(B, -1)
-                self.update_confidence(view_error)
+                if outputs['confidence_active']:
+                    self.update_confidence(batch, view_error)
+                outputs['view_confidence'] = self._get_view_confidence(batch, B, n_views_sel, outputs['image'].device)
         if return_buffer:
             outputs.update({'render_pkg':render_pkg}) 
         return outputs
