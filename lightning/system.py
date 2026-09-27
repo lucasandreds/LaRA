@@ -16,14 +16,37 @@ class system(L.LightningModule):
         super().__init__()
 
         self.cfg = cfg
-        self.loss = Losses()
+        self.loss = Losses(cfg)
         self.net = Network(cfg)
 
         self.validation_step_outputs = []
 
+    def _log_view_diagnostics(self, output, batch):
+        if 'view_confidence' not in output or 'view_error' not in output:
+            return
+
+        conf = output['view_confidence'].detach().mean(0)
+        err = output['view_error'].detach().mean(0)
+        for i in range(conf.shape[0]):
+            self.log(f'train/confidence_{i}', conf[i], prog_bar=False)
+            self.log(f'train/view_error_{i}', err[i], prog_bar=False)
+
+        noise_view = batch.get('meta', {}).get('noise_view', -1)
+        noise_angle = batch.get('meta', {}).get('noise_angle', 0.0)
+        if noise_view >= 0:
+            self.log('train/noise_view', float(noise_view), prog_bar=False)
+            self.log('train/noise_angle', float(noise_angle), prog_bar=False)
+            self.log('train/noise_view_confidence', conf[noise_view], prog_bar=False)
+            self.log('train/noise_view_error', err[noise_view], prog_bar=False)
+            if noise_view < conf.shape[0]:
+                self.log('train/confidence_gap_to_noisy', conf.max() - conf[noise_view], prog_bar=False)
+
     def training_step(self, batch, batch_idx):
         
         output = self.net(batch, with_fine=self.global_step>self.cfg.train.start_fine)
+        if getattr(self.cfg, 'use_confidence', False):
+            self._log_view_diagnostics(output, batch)
+
         loss, scalar_stats = self.loss(batch, output, self.global_step)
         for key, value in scalar_stats.items():
             prog_bar = True if key in ['psnr','mask','depth'] else False

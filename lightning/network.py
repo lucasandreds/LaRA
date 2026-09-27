@@ -291,6 +291,16 @@ class Network(L.LightningModule):
         self.scene_size = 0.5
         self.white_bkgd = white_bkgd
 
+        self.use_confidence = bool(getattr(cfg, 'use_confidence', getattr(getattr(cfg, 'confidence', None), 'use_confidence', False)))
+        self.confidence_temperature = float(getattr(cfg, 'confidence_temperature', getattr(getattr(cfg, 'confidence', None), 'temperature', 0.1)))
+        self.confidence_ema_beta = float(getattr(cfg, 'confidence_ema_beta', getattr(getattr(cfg, 'confidence', None), 'ema_beta', 0.9)))
+        self.confidence_min = float(getattr(cfg, 'confidence_min', getattr(getattr(cfg, 'confidence', None), 'min_confidence', 0.05)))
+        self.confidence_lambda = float(getattr(cfg, 'confidence_lambda', getattr(getattr(cfg, 'confidence', None), 'lambda_conf', 0.01)))
+        self.confidence_attention_scale = float(getattr(cfg, 'confidence_attention_scale', getattr(getattr(cfg, 'confidence', None), 'attention_scale', 1.0)))
+
+        self.register_buffer('view_confidence', torch.full((1, 4), 0.25, dtype=torch.float32))
+        self.register_buffer('view_error_ema', torch.zeros(1, 4, dtype=torch.float32))
+
         # modules
         self.img_encoder = DinoWrapper(
             model_name=cfg.model.encoder_backbone,
@@ -349,7 +359,47 @@ class Network(L.LightningModule):
         return grid.reshape(reso,reso,reso,3)*self.scene_size
 
     
-    def build_feat_vol(self, src_inps, img_feats, n_views_sel, batch):
+    def _confidence_from_errors(self, errors):
+        if not self.use_confidence:
+            return torch.full_like(errors, 1.0 / errors.shape[-1])
+        scores = torch.exp(-errors / max(self.confidence_temperature, 1e-6))
+        scores = scores.clamp_min(self.confidence_min)
+        scores = scores / scores.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return scores
+
+    def _get_view_confidence(self, batch_size, n_views_sel, device):
+        if not self.use_confidence:
+            conf = torch.full((batch_size, n_views_sel), 1.0 / n_views_sel, device=device, dtype=torch.float32)
+            return conf
+
+        conf = self.view_confidence.to(device).expand(batch_size, -1)
+        conf = conf[:, :n_views_sel]
+        conf = conf.clamp_min(self.confidence_min)
+        conf = conf / conf.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return conf
+
+    def update_confidence(self, current_errors):
+        if not self.use_confidence:
+            return
+
+        current_errors = current_errors.detach().mean(dim=0, keepdim=True)
+        self.view_error_ema = self.confidence_ema_beta * self.view_error_ema + (1 - self.confidence_ema_beta) * current_errors.to(self.view_error_ema.device)
+        conf = self._confidence_from_errors(self.view_error_ema)
+        self.view_confidence = conf.detach().to(self.view_confidence.device)
+
+    def compute_view_error(self, batch, output):
+        if 'image' not in output:
+            return None
+        rendered = output['image']
+        target = batch['tar_rgb'].permute(0,2,1,3,4)
+        B, H, Vw, C = rendered.shape
+        V = target.shape[2]
+        rendered = rendered.reshape(B, H, V, target.shape[-2], C)
+        target = target.reshape(B, H, V, target.shape[-2], C)
+        err = ((rendered - target) ** 2).mean(dim=(1,3,4))
+        return err
+
+    def build_feat_vol(self, src_inps, img_feats, n_views_sel, batch, view_conf):
 
         h,w = src_inps.shape[-2:]
         src_ixts = batch['tar_ixt'][:,:n_views_sel].reshape(-1,3,3)
@@ -375,6 +425,10 @@ class Network(L.LightningModule):
 
         # img features
         feats_vol = feats_vol.view(-1,n_views_sel,n_channel,self.feat_vol_reso,self.feat_vol_reso,self.feat_vol_reso)
+        if view_conf is not None:
+            base_conf = torch.full_like(view_conf, 1.0 / n_views_sel)
+            conf_scale = 1.0 + self.confidence_attention_scale * (view_conf / view_conf.mean(dim=-1, keepdim=True).clamp_min(1e-6) - 1.0)
+            feats_vol = feats_vol * conf_scale.view(-1, n_views_sel, 1, 1, 1, 1)
 
         return feats_vol
     
@@ -436,6 +490,8 @@ class Network(L.LightningModule):
         else:
             n_views_sel = self.cfg.n_views
 
+        view_conf = self._get_view_confidence(B, n_views_sel, batch['tar_rgb'].device) if self.use_confidence else None
+
         _inps =batch['tar_rgb'][:,:n_views_sel].reshape(B*n_views_sel,H,W,C)
         _inps = torch.einsum('bhwc->bchw', _inps)
 
@@ -445,7 +501,7 @@ class Network(L.LightningModule):
         img_feats = img_feats.reshape(*img_feats.shape[:2],H//token_size,W//token_size)
 
         # build 3D volume
-        feat_vol = self.build_feat_vol(_inps, img_feats, n_views_sel, batch) # B n_views_sel C D H W
+        feat_vol = self.build_feat_vol(_inps, img_feats, n_views_sel, batch, view_conf) # B n_views_sel C D H W
         
         # view embedding
         if self.cfg.model.view_embed_dim > 0:
@@ -527,6 +583,12 @@ class Network(L.LightningModule):
             outputs.append({k: torch.cat([d[k] for d in outputs_view], dim=1) for k in outputs_view[0]})
 
         outputs = {k: torch.stack([d[k] for d in outputs]) for k in outputs[0]}
+        if self.use_confidence:
+            view_error = self.compute_view_error(batch, outputs)
+            if view_error is not None:
+                outputs['view_error'] = view_error
+                outputs['view_confidence'] = self.view_confidence.to(outputs['image'].device).expand(B, -1)
+                self.update_confidence(view_error)
         if return_buffer:
             outputs.update({'render_pkg':render_pkg}) 
         return outputs

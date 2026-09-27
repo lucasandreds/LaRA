@@ -45,6 +45,9 @@ class GoogleObjsDataset(torch.utils.data.Dataset):
         self.scenes_name = scenes_name[i_test]
         
         self.n_group = cfg.n_group
+        self.pose_noise_probability = getattr(cfg, 'pose_noise_probability', 0.0)
+        self.pose_noise_max_angle = getattr(cfg, 'pose_noise_max_angle', 0.0)
+        self.pose_noise_seed = getattr(cfg, 'pose_noise_seed', 0)
         self.build_metas()
 
     def build_metas(self):
@@ -117,9 +120,15 @@ class GoogleObjsDataset(torch.utils.data.Dataset):
         noise_rot = float(os.environ.get('NOISE_ROT', 0))
         noise_trans = float(os.environ.get('NOISE_TRANS', 0))
         noise_view = int(os.environ.get('NOISE_VIEW', 1))
+        noise_angle = 0.0
+        if self.pose_noise_probability > 0 and np.random.rand() < self.pose_noise_probability:
+            noise_view = int(np.random.randint(1, self.n_group))
+            noise_angle = float(np.random.uniform(0.0, self.pose_noise_max_angle))
+            noise_rot = noise_angle
+            noise_trans = 0.0
         assert 1 <= noise_view < self.n_group, "a vista 0 e referencia; ruido so nas vistas de entrada 1..n_group-1"
         if noise_rot > 0 or noise_trans > 0:
-            rng = np.random.default_rng(int(os.environ.get('NOISE_SEED', 0)) + index)
+            rng = np.random.default_rng(int(os.environ.get('NOISE_SEED', self.pose_noise_seed)) + index)
             tar_c2ws[noise_view] = perturb_c2w(tar_c2ws[noise_view], noise_rot, noise_trans, rng)
             tar_w2cs[noise_view] = np.linalg.inv(tar_c2ws[noise_view]).astype(np.float32)
         # ================================================================
@@ -149,7 +158,7 @@ class GoogleObjsDataset(torch.utils.data.Dataset):
                     })
         near_far = np.array([0.5, 2.5]).astype(np.float32)
         ret.update({'near_far': np.array(near_far).astype(np.float32)})
-        ret.update({'meta': {'scene': scene_name, 'tar_view': tar_views, 'frame_id': 0}})
+        ret.update({'meta': {'scene': scene_name, 'tar_view': tar_views, 'frame_id': 0, 'noise_view': int(noise_view) if (noise_rot > 0 or noise_trans > 0) else -1, 'noise_angle': float(noise_angle)}})
         ret['meta'].update({f'tar_h': int(H), f'tar_w': int(W)})
 
         rays = build_rays(tar_c2ws, tar_ixts.copy(), H, W, 1.0)
