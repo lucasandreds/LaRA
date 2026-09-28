@@ -23,6 +23,12 @@ class Losses(nn.Module):
         B,V,H,W = batch['tar_rgb'].shape[:-1]
 
         tar_rgb = batch['tar_rgb'].permute(0,2,1,3,4).reshape(B,H,V*W,3)
+        tar_rgb_view = batch['tar_rgb']
+
+        use_conf = getattr(self.cfg, 'use_confidence', False) and output.get('confidence_active', True)
+        if use_conf:
+            conf_w = output['view_confidence'].detach() # Shape: (B, V)
+            conf_w = conf_w / (conf_w.sum(dim=1, keepdim=True) + 1e-8) * V
         
         if 'image' in output:
 
@@ -32,11 +38,18 @@ class Losses(nn.Module):
                     continue
 
                 color_loss_all = (output[f'image{prex}']-tar_rgb)**2
-                loss += color_loss_all.mean()
-
+                if use_conf:
+                    color_loss_view = (output[f'image{prex}'].reshape(B, H, V, W, 3).permute(0, 2, 1, 3, 4) - tar_rgb_view)**2
+                    color_loss_view = color_loss_view.mean(dim=(2, 3, 4)) # Shape: (B, V)
+                    weighted_mse = (color_loss_view * conf_w).mean()
+                    loss += weighted_mse
+                    scalar_stats.update({f'mse{prex}': weighted_mse.detach()})
+                else:
+                    loss += color_loss_all.mean()
+                    scalar_stats.update({f'mse{prex}': color_loss_all.mean().detach()})
+                
                 psnr = -10. * torch.log(color_loss_all.detach().mean()) / \
                     torch.log(torch.Tensor([10.]).to(color_loss_all.device))
-                scalar_stats.update({f'mse{prex}': color_loss_all.mean().detach()})
                 scalar_stats.update({f'psnr{prex}': psnr})
 
                 with autocast(enabled=False): 
@@ -57,15 +70,6 @@ class Losses(nn.Module):
                     scalar_stats.update({f'normal{prex}': normal_error.detach()})
                     loss += normal_error*0.2
 
-        if getattr(self.cfg, 'use_confidence', False) and output.get('confidence_active', True) and 'view_error' in output and 'view_confidence' in output:
-            errors = output['view_error']
-            confidence = output['view_confidence'].detach()
-            if errors.dim() == 2 and confidence.dim() == 2:
-                conf_loss = (confidence * errors).mean()
-                scalar_stats['loss_conf'] = conf_loss.detach()
-                scalar_stats['loss_lara'] = loss.detach() if isinstance(loss, torch.Tensor) else torch.tensor(float(loss))
-                scalar_stats['loss_total'] = (loss + self.cfg.confidence_lambda * conf_loss).detach()
-                loss = loss + self.cfg.confidence_lambda * conf_loss
-
+        scalar_stats['loss_total'] = loss.detach() if isinstance(loss, torch.Tensor) else torch.tensor(float(loss))
         return loss, scalar_stats
 
