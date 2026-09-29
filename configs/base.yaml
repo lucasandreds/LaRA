@@ -1,4 +1,12 @@
-gpu_id: [4,5,6,7]
+gpu_id: [0]
+
+use_confidence: false
+confidence_temperature: 0.1
+confidence_ema_beta: 0.9
+confidence_min: 0.05
+confidence_lambda: 0.01
+confidence_attention_scale: 1.0
+confidence_warmup_steps: 2000
 
 exp_name: LaRa/release-test
 n_views: 4
@@ -58,10 +66,13 @@ train:
     warmup_iters: 1000
     n_epoch: 30
     limit_train_batches: 0.2
-    limit_val_batches: 0.02
+    limit_val_batches: 0.03
     check_val_every_n_epoch: 1
     start_fine: 5000
     use_rand_views: False
+    pose_noise_probability: 0.0
+    pose_noise_max_angle: 20.0
+    pose_noise_seed: 0
 test:
     batch_size: 3
 

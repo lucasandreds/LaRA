@@ -28,6 +28,34 @@ import lpips
 import torch.nn.functional as F
 from tools.depth import acc_threshold,abs_error
 
+
+def compute_per_view_metrics(images, img_gt, lpips_vgg_fun, lpips_alex_fun, device):
+    """Compute PSNR/SSIM/LPIPS per input view for the rendered stack."""
+    n_views = img_gt.shape[1]
+    psnr_per_view, ssim_per_view, lpips_vgg_per_view, lpips_alex_per_view = [], [], [], []
+
+    for k in range(n_views):
+        view_img = images[:, k:k+1]
+        view_gt = img_gt[:, k:k+1]
+        color_loss = (view_img - view_gt) ** 2
+        psnr = -10. * torch.log(color_loss.mean()) / torch.log(torch.tensor([10.]).to(device))
+        psnr_per_view.append(float(psnr.detach().cpu().item()))
+
+        ssim_val = ssim(view_img.permute(0,3,1,2), view_gt.permute(0,3,1,2), data_range=1.0, size_average=False)
+        ssim_per_view.append(float(ssim_val.detach().cpu().mean().item()))
+
+        lpips_vgg = lpips_vgg_fun(view_gt.permute(0,3,1,2)*2-1, view_img.permute(0,3,1,2)*2-1)
+        lpips_alex = lpips_alex_fun(view_gt.permute(0,3,1,2)*2-1, view_img.permute(0,3,1,2)*2-1)
+        lpips_vgg_per_view.append(float(lpips_vgg.detach().cpu().mean().item()))
+        lpips_alex_per_view.append(float(lpips_alex.detach().cpu().mean().item()))
+
+    return {
+        'psnr': psnr_per_view,
+        'ssim': ssim_per_view,
+        'lpips_vgg': lpips_vgg_per_view,
+        'lpips_alex': lpips_alex_per_view,
+    }
+
 @torch.no_grad()
 def main(cfg):
 
@@ -68,7 +96,7 @@ def main(cfg):
         normal_white = ((output['rend_normal_fine'][0]*alpha+1-alpha) + 1)/2
 
         n_view = cfg.n_views
-        
+
         # ===== detector A: PSNR de cada vista de entrada na propria pose (analogo a Eq. 6 do SG-NeRF) =====
         if i == 0:
             print('chaves da saida do modelo:', list(output.keys()))
@@ -76,6 +104,13 @@ def main(cfg):
             N_tot = sample['tar_rgb'].shape[1]
             W_ = images.shape[1] // N_tot
             rec = {'scene': name}
+            if 'view_confidence' in output:
+                rec['confidence'] = output['view_confidence'][0].detach().cpu().tolist()
+            if 'view_error' in output:
+                rec['view_error'] = output['view_error'][0].detach().cpu().tolist()
+            if 'meta' in sample and 'noise_view' in sample['meta']:
+                rec['noise_view'] = int(sample['meta']['noise_view'][0]) if isinstance(sample['meta']['noise_view'], torch.Tensor) else int(sample['meta']['noise_view'])
+                rec['noise_angle'] = float(sample['meta']['noise_angle'][0]) if isinstance(sample['meta']['noise_angle'], torch.Tensor) else float(sample['meta']['noise_angle'])
             for tag, key in [('fine', 'image_fine'), ('coarse', 'image')]:
                 if key in output:
                     img_k = output[key][0]
@@ -84,6 +119,18 @@ def main(cfg):
             with open(os.environ['DETECT_LOG'], 'a') as f:
                 f.write(json.dumps(rec) + '\n')
         # ==================================================================================================
+
+        per_view = compute_per_view_metrics(images, img_gt, lpips_vgg_fun, lpips_alex_fun, device)
+        if 'view_confidence' in output:
+            per_view['confidence'] = output['view_confidence'][0].detach().cpu().tolist()
+        if 'view_error' in output:
+            per_view['view_error'] = output['view_error'][0].detach().cpu().tolist()
+        if 'meta' in sample and 'noise_view' in sample['meta']:
+            per_view['noise_view'] = int(sample['meta']['noise_view'][0]) if isinstance(sample['meta']['noise_view'], torch.Tensor) else int(sample['meta']['noise_view'])
+            per_view['noise_angle'] = float(sample['meta']['noise_angle'][0]) if isinstance(sample['meta']['noise_angle'], torch.Tensor) else float(sample['meta']['noise_angle'])
+        if i == 0:
+            print('per-view diagnostic keys:', list(per_view.keys()))
+            print('sample per-view metrics:', per_view)
 
         
         if i<100:
